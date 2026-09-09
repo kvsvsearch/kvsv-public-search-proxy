@@ -143,3 +143,53 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8781))
     app.run(host="0.0.0.0", port=port)
+
+# ==========================================================================
+# Hub live-status feed -- added by SETUP_HUB_FEED.ps1
+# ==========================================================================
+import json
+import time
+
+HUB_FEED_TOKEN = os.environ.get("HUB_FEED_TOKEN", "")  # set in Railway dashboard only, never in source
+HUB_FEED_STORE_PATH = os.environ.get("HUB_FEED_STORE_PATH", "/tmp/hub_feed_store.json")
+_hub_feed_store = {"data": None, "updated_at": None}
+
+if os.path.exists(HUB_FEED_STORE_PATH):
+    try:
+        with open(HUB_FEED_STORE_PATH) as f:
+            _hub_feed_store = json.load(f)
+    except Exception:
+        pass
+
+EXCLUDED_TAB_NAME = "Genealogy_RESTRICTED"
+ALLOWED_TABS = {"Dashboard", "Coding_Tech_Tasks", "Status_Check_Needed", "Errors_Corrections", "Status_Log"}
+
+
+@app.route("/api/hub-status", methods=["GET", "POST"])
+def hub_status():
+    if request.method == "POST":
+        auth = request.headers.get("Authorization", "")
+        if not HUB_FEED_TOKEN or auth != f"Bearer {HUB_FEED_TOKEN}":
+            return jsonify({"error": "unauthorized"}), 401
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return jsonify({"error": "valid JSON body required"}), 400
+        if isinstance(payload, dict):
+            keys = set(payload.keys())
+            if EXCLUDED_TAB_NAME in keys:
+                return jsonify({"error": f"payload contains excluded tab '{EXCLUDED_TAB_NAME}' — rejected"}), 400
+            unexpected = keys - ALLOWED_TABS
+            if unexpected:
+                return jsonify({"error": f"payload contains tabs outside the allowlist: {sorted(unexpected)} — rejected"}), 400
+        _hub_feed_store["data"] = payload
+        _hub_feed_store["updated_at"] = time.time()
+        try:
+            with open(HUB_FEED_STORE_PATH, "w") as f:
+                json.dump(_hub_feed_store, f)
+        except Exception as e:
+            return jsonify({"error": f"stored in memory but failed to persist to disk: {e}"}), 500
+        return jsonify({"ok": True, "updated_at": _hub_feed_store["updated_at"]})
+
+    if _hub_feed_store["data"] is None:
+        return jsonify({"error": "no data published yet"}), 404
+    return jsonify({"data": _hub_feed_store["data"], "updated_at": _hub_feed_store["updated_at"]})
