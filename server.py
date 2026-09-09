@@ -4,6 +4,26 @@ import requests
 
 app = Flask(__name__)
 
+# Allow the public GitHub Pages site to call this API from a real browser.
+# This is a read-only, no-auth, no-cookie public search proxy -- there is
+# no session/credential data to protect via CORS, only the shared NARA key
+# which stays server-side regardless. Restricted to the known site origins
+# rather than "*" so random third parties can't quietly burn the shared
+# NARA/WikiTree rate-limit quota through this proxy.
+ALLOWED_ORIGINS = {
+    "https://kvsvsearch.github.io",
+}
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
 WIKITREE_URL = "https://api.wikitree.com/api.php"
 NARA_URL = "https://catalog.archives.gov/api/v2/records/search"
 # Read from environment only -- never hardcode a real key in source that could
