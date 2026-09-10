@@ -65,6 +65,15 @@ def wikitree_search():
         data = resp.json()
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+    # WikiTree returns HTTP 200 with a body like [{"status": "Limit exceeded."}]
+    # when it is rate-limiting us -- that has no "matches" key, so it was
+    # previously silently treated as "zero legitimate results" instead of an
+    # error. Surface it honestly so the frontend shows a real error message
+    # instead of quietly dropping every non-US/Canada result.
+    if not resp.ok:
+        return jsonify({"error": f"WikiTree returned HTTP {resp.status_code}"}), 502
+    if isinstance(data, list) and data and isinstance(data[0], dict) and "status" in data[0] and "matches" not in data[0]:
+        return jsonify({"error": f"WikiTree: {data[0]['status']}"}), 502
     matches = []
     if isinstance(data, list) and data and "matches" in data[0]:
         matches = data[0]["matches"]
