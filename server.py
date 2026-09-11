@@ -204,9 +204,15 @@ def hub_status():
     return jsonify({"data": _hub_feed_store["data"], "updated_at": _hub_feed_store["updated_at"]})
 
 # ==========================================================================
-# Contribute intake
+# Contribute intake -- hardened v4
 # ==========================================================================
 import hashlib
+import logging
+import secrets
+import datetime as _dt
+import uuid as _uuid
+
+_log = logging.getLogger("kvsv.contribute")
 
 try:
     from sendgrid import SendGridAPIClient
@@ -227,9 +233,48 @@ SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 SENDGRID_FROM = os.environ.get("SENDGRID_FROM", "")
 SENDGRID_TO = os.environ.get("SENDGRID_TO", "")
 TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")
-CONTRIBUTE_HASH_PEPPER = os.environ.get("CONTRIBUTE_HASH_PEPPER", "")
+CONTRIBUTE_IP_PEPPER = os.environ.get("CONTRIBUTE_IP_PEPPER", "")
+CONTRIBUTE_EMAIL_PEPPER = os.environ.get("CONTRIBUTE_EMAIL_PEPPER", "")
 FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "")
+CONTRIBUTE_HASH_PEPPER = os.environ.get("CONTRIBUTE_HASH_PEPPER", "")  # noqa: F841
 
+CORRECTION_CONTACT = "jasoneugeneb9@gmail.com"
+MAX_BODY_BYTES = 64 * 1024
+IDEMPOTENCY_WINDOW_SECONDS = 24 * 3600
+
+RATE_LIMITS = (
+    ("ip",    "minute", 60,   5),
+    ("ip",    "hour",   3600, 20),
+    ("email", "hour",   3600, 3),
+)
+
+CATEGORIES = {
+    "Family research request",
+    "Public genealogy submission",
+    "Professional genealogist submission",
+    "New client inquiry",
+    "Correction or evidence update",
+    "Oral-history submission",
+    "Institutional or community archive contribution",
+    "General question or referral",
+}
+
+FIELD_MAX = {
+    "name": 200, "email": 320, "phone": 60, "organization": 200,
+    "category": 100, "family": 200, "names": 500,
+    "relationships": 500, "locations": 500, "dates": 200,
+    "narrative": 8000, "research_question": 2000,
+    "source_description": 2000, "document_reference": 500,
+}
+STRING_FIELDS = set(FIELD_MAX.keys())
+BOOL_FIELDS = {"contactConsent", "publicationConsent",
+               "ackPublicRecord", "ackAccuracy"}
+META_FIELDS = {"idempotency_key", "turnstile_token"}
+ALLOWED_FIELDS = STRING_FIELDS | BOOL_FIELDS | META_FIELDS
+REQUIRED_STRINGS = ("name", "email", "category", "narrative")
+REQUIRED_BOOLS = ("ackPublicRecord", "ackAccuracy")
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _contribute_firestore = None
 
 
@@ -246,130 +291,354 @@ def _get_contribute_firestore():
         _contribute_firestore = _fb_firestore.client()
         return _contribute_firestore
     except Exception:
+        _log.exception("contribute: firebase init failed")
         return None
 
 
 def _verify_turnstile(token, remote_ip):
     if not TURNSTILE_SECRET:
-        return False, "turnstile_not_configured"
-    if not token:
-        return False, "missing_turnstile_token"
+        return False
+    if not isinstance(token, str) or not token:
+        return False
     try:
         r = requests.post(
             "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-            data={
-                "secret": TURNSTILE_SECRET,
-                "response": token,
-                "remoteip": remote_ip or "",
-            },
+            data={"secret": TURNSTILE_SECRET,
+                  "response": token,
+                  "remoteip": remote_ip or ""},
             timeout=10,
         )
-        body = r.json()
-        if body.get("success"):
-            return True, None
-        return False, body.get("error-codes", ["verification_failed"])
-    except Exception as e:
-        return False, str(e)
+        return bool(r.json().get("success"))
+    except Exception:
+        _log.exception("contribute: turnstile request failed")
+        return False
 
 
-def _hash_submitter_email(email):
-    if not CONTRIBUTE_HASH_PEPPER:
+def _pepper_hash(pepper, value):
+    if not pepper or not value:
         return None
-    return hashlib.sha256(
-        (CONTRIBUTE_HASH_PEPPER + email.lower().strip()).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256((pepper + value).encode("utf-8")).hexdigest()
 
 
-@app.route("/api/contribute", methods=["POST", "OPTIONS"])
-def contribute():
-    if request.method == "OPTIONS":
-        resp = app.make_default_options_response()
-        origin = request.headers.get("Origin", "")
-        if origin in ALLOWED_ORIGINS:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-            resp.headers["Vary"] = "Origin"
-        return resp
+def _is_uuid_v4(s):
+    if not isinstance(s, str) or len(s) != 36:
+        return False
+    try:
+        u = _uuid.UUID(s)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return u.version == 4 and str(u) == s.lower()
 
-    payload = request.get_json(silent=True)
+
+def _gen_case_ref():
+    suffix = "".join(secrets.choice(_CROCKFORD) for _ in range(8))
+    year = _dt.datetime.now(_dt.timezone.utc).year
+    return f"KVSV-{year}-{suffix}"
+
+
+def _validate_payload(payload):
     if not isinstance(payload, dict):
-        return jsonify({"error": "valid JSON body required"}), 400
+        return None, "invalid_body"
+    if set(payload.keys()) - ALLOWED_FIELDS:
+        return None, "unknown_fields"
+    if not _is_uuid_v4(payload.get("idempotency_key")):
+        return None, "invalid_idempotency"
+    tt = payload.get("turnstile_token")
+    if not isinstance(tt, str) or not tt:
+        return None, "invalid_turnstile_token"
+    cleaned = {}
+    for f in STRING_FIELDS:
+        if f in payload:
+            v = payload[f]
+            if not isinstance(v, str):
+                return None, "invalid_type"
+            v = v.strip()
+            if len(v) > FIELD_MAX[f]:
+                return None, "field_too_long"
+            cleaned[f] = v
+    for f in BOOL_FIELDS:
+        if f in payload:
+            v = payload[f]
+            if not isinstance(v, bool):
+                return None, "invalid_type"
+            cleaned[f] = v
+    for f in REQUIRED_STRINGS:
+        if not cleaned.get(f):
+            return None, "missing_required"
+    if cleaned.get("category") not in CATEGORIES:
+        return None, "invalid_category"
+    for f in REQUIRED_BOOLS:
+        if cleaned.get(f) is not True:
+            return None, "acknowledgment_missing"
+    cleaned.setdefault("contactConsent", False)
+    cleaned.setdefault("publicationConsent", False)
+    return {"cleaned": cleaned,
+            "idempotency_key": payload["idempotency_key"],
+            "turnstile_token": tt}, None
 
-    required = ["name", "email", "category", "narrative"]
-    missing = [k for k in required if not str(payload.get(k, "") or "").strip()]
-    if missing:
-        return jsonify({"error": f"missing required fields: {missing}"}), 400
 
-    turnstile_token = str(payload.get("turnstile_token", "") or "")
-    ok, err = _verify_turnstile(turnstile_token, request.remote_addr)
-    if not ok:
-        return jsonify({"error": "captcha verification failed", "detail": err}), 400
+def _now_utc():
+    return _dt.datetime.now(_dt.timezone.utc)
 
-    submitter_hash = _hash_submitter_email(str(payload.get("email", "")))
 
-    submission = {
-        "name": str(payload.get("name", "")).strip(),
-        "email": str(payload.get("email", "")).strip(),
-        "phone": str(payload.get("phone", "")).strip(),
-        "organization": str(payload.get("organization", "")).strip(),
-        "category": str(payload.get("category", "")).strip(),
-        "family": str(payload.get("family", "")).strip(),
-        "names": str(payload.get("names", "")).strip(),
-        "relationships": str(payload.get("relationships", "")).strip(),
-        "locations": str(payload.get("locations", "")).strip(),
-        "dates": str(payload.get("dates", "")).strip(),
-        "narrative": str(payload.get("narrative", "")).strip(),
-        "research_question": str(payload.get("research_question", "")).strip(),
-        "source_description": str(payload.get("source_description", "")).strip(),
-        "document_reference": str(payload.get("document_reference", "")).strip(),
-        "consent_contact": bool(payload.get("consent_contact")),
-        "consent_publish": bool(payload.get("consent_publish")),
-        "submitter_hash": submitter_hash,
-        "status": "intake_review",
-        "gate": "gate_0_intake_integrity",
-        "assigned_tier": None,
-        "final_disposition": None,
-        "created_at": time.time(),
-        "source": "kvsvsearch.github.io/contribute",
-    }
+def _rate_limit_ref(db, kind, key_hash, window_name):
+    return (db.collection("contribute_rate_limits")
+              .document(kind)
+              .collection(key_hash)
+              .document(window_name))
+
+
+def _as_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_dt.timezone.utc)
+    return dt
+
+
+@app.route("/api/contribute", methods=["POST"])
+def contribute():
+    if not request.is_json:
+        return jsonify({"error": "The submission could not be processed."}), 415
+
+    if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
+        return jsonify({"error": "The submission could not be processed."}), 413
+    raw = request.get_data(cache=True)
+    if len(raw) > MAX_BODY_BYTES:
+        return jsonify({"error": "The submission could not be processed."}), 413
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw else None
+    except Exception:
+        return jsonify({"error": "The submission could not be processed."}), 400
+
+    validated, err = _validate_payload(payload)
+    if err:
+        _log.info("contribute: validation failed: %s", err)
+        return jsonify({"error": "The submission could not be processed."}), 400
+
+    cleaned = validated["cleaned"]
+    idem = validated["idempotency_key"]
+    ip = request.remote_addr or ""
+
+    if not _verify_turnstile(validated["turnstile_token"], ip):
+        _log.info("contribute: turnstile rejected")
+        return jsonify({"error": "The submission could not be processed."}), 400
 
     db = _get_contribute_firestore()
     if db is None:
-        return jsonify({"error": "storage_not_configured"}), 500
+        _log.error("contribute: firestore not configured")
+        return jsonify({"error": "The submission could not be processed."}), 503
+
+    ip_hash = _pepper_hash(CONTRIBUTE_IP_PEPPER, ip) if ip else None
+    email_norm = cleaned["email"].lower()
+    email_hash = _pepper_hash(CONTRIBUTE_EMAIL_PEPPER, email_norm)
+    idem_hash = hashlib.sha256(idem.encode("utf-8")).hexdigest()
+
+    submission_ref = db.collection("contribute_submissions").document()
+    submission_id_stable = submission_ref.id
+    case_reference_stable = _gen_case_ref()
+    idem_ref = db.collection("contribute_idempotency").document(idem_hash)
+
+    now_utc = _now_utc()
+    now_epoch = int(now_utc.timestamp())
+    idem_expires = now_utc + _dt.timedelta(seconds=IDEMPOTENCY_WINDOW_SECONDS)
+
+    expiries_by_window = {}
+    for kind, window_name, window_seconds, _ in RATE_LIMITS:
+        expiries_by_window[(kind, window_name)] = (
+            now_utc + _dt.timedelta(seconds=window_seconds)
+        )
+
+    limit_refs = []
+    for kind, window_name, window_seconds, max_count in RATE_LIMITS:
+        key_hash = ip_hash if kind == "ip" else email_hash
+        if not key_hash:
+            continue
+        lref = _rate_limit_ref(db, kind, key_hash, window_name)
+        limit_refs.append((kind, window_name, window_seconds, max_count, lref))
+
+    @_fb_firestore.transactional
+    def _tx(transaction):
+        idem_snap = idem_ref.get(transaction=transaction)
+
+        limit_reads = []
+        for kind, window_name, window_seconds, max_count, lref in limit_refs:
+            lsnap = lref.get(transaction=transaction)
+            limit_reads.append(
+                (kind, window_name, window_seconds, max_count, lref, lsnap)
+            )
+
+        if idem_snap.exists:
+            data = idem_snap.to_dict() or {}
+            ref = data.get("case_reference")
+            expires_at = _as_utc(data.get("expiresAt"))
+            if ref and expires_at is not None and expires_at > now_utc:
+                return {"outcome": "already_received", "case_reference": ref}
+
+        limit_plans = []
+        for kind, window_name, window_seconds, max_count, lref, lsnap in limit_reads:
+            if lsnap.exists:
+                d = lsnap.to_dict() or {}
+                ws = int(d.get("windowStartEpoch", 0))
+                ct = int(d.get("count", 0))
+                if now_epoch - ws >= window_seconds:
+                    ws, ct = now_epoch, 0
+            else:
+                ws, ct = now_epoch, 0
+            if ct >= max_count:
+                return {"outcome": "rate_limited"}
+            limit_plans.append((kind, window_name, lref, ws, ct))
+
+        transaction.set(submission_ref, {
+            "case_reference": case_reference_stable,
+            "category": cleaned["category"],
+            "name": cleaned["name"],
+            "email": cleaned["email"],
+            "phone": cleaned.get("phone", ""),
+            "organization": cleaned.get("organization", ""),
+            "family": cleaned.get("family", ""),
+            "names": cleaned.get("names", ""),
+            "relationships": cleaned.get("relationships", ""),
+            "locations": cleaned.get("locations", ""),
+            "dates": cleaned.get("dates", ""),
+            "narrative": cleaned["narrative"],
+            "research_question": cleaned.get("research_question", ""),
+            "source_description": cleaned.get("source_description", ""),
+            "document_reference": cleaned.get("document_reference", ""),
+            "contactConsent": bool(cleaned["contactConsent"]),
+            "publicationConsent": bool(cleaned["publicationConsent"]),
+            "ackPublicRecord": True,
+            "ackAccuracy": True,
+            "status": "intake_review",
+            "gate": "gate_0_intake_integrity",
+            "assigned_tier": None,
+            "final_disposition": None,
+            "idempotency_hash": idem_hash,
+            "created_at": _fb_firestore.SERVER_TIMESTAMP,
+            "updated_at": _fb_firestore.SERVER_TIMESTAMP,
+            "source": "kvsvsearch.github.io/contribute",
+            "audit": [{
+                "event": "created",
+                "at": now_utc,
+                "actor": "server",
+                "note": "Contribution received through the public intake form.",
+            }],
+        })
+
+        transaction.set(idem_ref, {
+            "case_reference": case_reference_stable,
+            "submission_id": submission_id_stable,
+            "created_at": _fb_firestore.SERVER_TIMESTAMP,
+            "expiresAt": idem_expires,
+        })
+
+        for kind, window_name, lref, ws, ct in limit_plans:
+            transaction.set(lref, {
+                "windowStartEpoch": ws,
+                "count": ct + 1,
+                "expiresAt": expiries_by_window[(kind, window_name)],
+            })
+
+        return {"outcome": "created",
+                "case_reference": case_reference_stable,
+                "submission_id": submission_id_stable}
 
     try:
-        ref = db.collection("contribute_submissions").document()
-        case_id = ref.id
-        submission["case_id"] = case_id
-        ref.set(submission)
-    except Exception as e:
-        return jsonify({"error": f"storage failed: {e}"}), 500
+        tx_result = _tx(db.transaction())
+    except Exception:
+        _log.exception("contribute: transaction failed")
+        return jsonify({"error": "The submission could not be processed."}), 503
 
-    email_sent = False
-    email_error = None
+    outcome = tx_result.get("outcome")
+    case_reference = tx_result.get("case_reference")
+
+    if outcome == "rate_limited":
+        return jsonify({"error": "Please try again later."}), 429
+
+    if outcome == "already_received":
+        return jsonify({
+            "ok": True,
+            "result": "already_received",
+            "case_reference": case_reference,
+        }), 200
+
+    if outcome != "created":
+        _log.error("contribute: unknown transaction outcome: %r", outcome)
+        return jsonify({"error": "The submission could not be processed."}), 503
+
+    submission_id = tx_result["submission_id"]
+    received_at = _now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    reviewer_ok = False
     if _SENDGRID_AVAILABLE and SENDGRID_API_KEY and SENDGRID_FROM and SENDGRID_TO:
         try:
-            body_lines = [
-                f"{k}: {v}" for k, v in submission.items() if k != "submitter_hash"
-            ]
-            message = Mail(
+            body = (
+                f"Case reference: {case_reference}\n"
+                f"Received: {received_at}\n"
+                f"Category: {cleaned['category']}\n"
+                f"Submitter name: {cleaned['name']}\n"
+                f"Submitter email: {cleaned['email']}\n"
+                f"Family/surname: {cleaned.get('family','') or '(none)'}\n"
+                f"Contact consent: {bool(cleaned['contactConsent'])}\n"
+                f"Publication consent: {bool(cleaned['publicationConsent'])}\n\n"
+                f"Open Firestore Console, collection contribute_submissions, "
+                f"and look up the document whose case_reference is "
+                f"{case_reference}.\n"
+            )
+            SendGridAPIClient(SENDGRID_API_KEY).send(Mail(
                 from_email=SENDGRID_FROM,
                 to_emails=SENDGRID_TO,
-                subject=f"KVSV Contribute -- new submission {case_id}",
-                plain_text_content="\n".join(body_lines),
+                subject=f"KVSV Contribute -- new submission {case_reference}",
+                plain_text_content=body,
+            ))
+            reviewer_ok = True
+        except Exception:
+            _log.exception("contribute: reviewer email send failed")
+
+    submitter_ok = False
+    if _SENDGRID_AVAILABLE and SENDGRID_API_KEY and SENDGRID_FROM:
+        try:
+            body = (
+                f"We have received your submission.\n\n"
+                f"Case reference: {case_reference}\n"
+                f"Received: {received_at}\n"
+                f"Category: {cleaned['category']}\n\n"
+                f"Your submission is not automatically published. "
+                f"KVSV researchers review contributions before any "
+                f"publication decision.\n\n"
+                f"For correction or deletion requests, contact "
+                f"{CORRECTION_CONTACT}.\n"
             )
-            SendGridAPIClient(SENDGRID_API_KEY).send(message)
-            email_sent = True
-        except Exception as e:
-            email_error = str(e)
-    else:
-        email_error = "sendgrid_not_configured"
+            SendGridAPIClient(SENDGRID_API_KEY).send(Mail(
+                from_email=SENDGRID_FROM,
+                to_emails=cleaned["email"],
+                subject=f"KVSV Contribute -- receipt {case_reference}",
+                plain_text_content=body,
+            ))
+            submitter_ok = True
+        except Exception:
+            _log.exception("contribute: submitter receipt send failed")
+
+    email_audit_at = _now_utc()
+    try:
+        db.collection("contribute_submissions").document(submission_id).update({
+            "updated_at": _fb_firestore.SERVER_TIMESTAMP,
+            "audit": _fb_firestore.ArrayUnion([
+                {"event": "reviewer_email_accepted_by_provider"
+                    if reviewer_ok else "reviewer_email_provider_request_failed",
+                 "at": email_audit_at,
+                 "actor": "server"},
+                {"event": "submitter_receipt_accepted_by_provider"
+                    if submitter_ok else "submitter_receipt_provider_request_failed",
+                 "at": email_audit_at,
+                 "actor": "server"},
+            ])
+        })
+    except Exception:
+        _log.exception("contribute: audit write failed")
 
     return jsonify({
         "ok": True,
-        "case_id": case_id,
-        "status": "intake_review",
-        "email_sent": email_sent,
-        "email_error": email_error,
+        "result": "created",
+        "case_reference": case_reference,
     }), 200
