@@ -20,7 +20,7 @@ def add_cors_headers(response):
     if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
-        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
@@ -202,3 +202,174 @@ def hub_status():
     if _hub_feed_store["data"] is None:
         return jsonify({"error": "no data published yet"}), 404
     return jsonify({"data": _hub_feed_store["data"], "updated_at": _hub_feed_store["updated_at"]})
+
+# ==========================================================================
+# Contribute intake
+# ==========================================================================
+import hashlib
+
+try:
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail
+    _SENDGRID_AVAILABLE = True
+except ImportError:
+    _SENDGRID_AVAILABLE = False
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials as _fb_credentials
+    from firebase_admin import firestore as _fb_firestore
+    _FIREBASE_AVAILABLE = True
+except ImportError:
+    _FIREBASE_AVAILABLE = False
+
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+SENDGRID_FROM = os.environ.get("SENDGRID_FROM", "")
+SENDGRID_TO = os.environ.get("SENDGRID_TO", "")
+TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")
+CONTRIBUTE_HASH_PEPPER = os.environ.get("CONTRIBUTE_HASH_PEPPER", "")
+FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "")
+
+_contribute_firestore = None
+
+
+def _get_contribute_firestore():
+    global _contribute_firestore
+    if _contribute_firestore is not None:
+        return _contribute_firestore
+    if not (_FIREBASE_AVAILABLE and FIREBASE_CREDENTIALS_JSON):
+        return None
+    try:
+        if not firebase_admin._apps:
+            cred = _fb_credentials.Certificate(json.loads(FIREBASE_CREDENTIALS_JSON))
+            firebase_admin.initialize_app(cred)
+        _contribute_firestore = _fb_firestore.client()
+        return _contribute_firestore
+    except Exception:
+        return None
+
+
+def _verify_turnstile(token, remote_ip):
+    if not TURNSTILE_SECRET:
+        return False, "turnstile_not_configured"
+    if not token:
+        return False, "missing_turnstile_token"
+    try:
+        r = requests.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={
+                "secret": TURNSTILE_SECRET,
+                "response": token,
+                "remoteip": remote_ip or "",
+            },
+            timeout=10,
+        )
+        body = r.json()
+        if body.get("success"):
+            return True, None
+        return False, body.get("error-codes", ["verification_failed"])
+    except Exception as e:
+        return False, str(e)
+
+
+def _hash_submitter_email(email):
+    if not CONTRIBUTE_HASH_PEPPER:
+        return None
+    return hashlib.sha256(
+        (CONTRIBUTE_HASH_PEPPER + email.lower().strip()).encode("utf-8")
+    ).hexdigest()
+
+
+@app.route("/api/contribute", methods=["POST", "OPTIONS"])
+def contribute():
+    if request.method == "OPTIONS":
+        resp = app.make_default_options_response()
+        origin = request.headers.get("Origin", "")
+        if origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            resp.headers["Vary"] = "Origin"
+        return resp
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "valid JSON body required"}), 400
+
+    required = ["name", "email", "category", "narrative"]
+    missing = [k for k in required if not str(payload.get(k, "") or "").strip()]
+    if missing:
+        return jsonify({"error": f"missing required fields: {missing}"}), 400
+
+    turnstile_token = str(payload.get("turnstile_token", "") or "")
+    ok, err = _verify_turnstile(turnstile_token, request.remote_addr)
+    if not ok:
+        return jsonify({"error": "captcha verification failed", "detail": err}), 400
+
+    submitter_hash = _hash_submitter_email(str(payload.get("email", "")))
+
+    submission = {
+        "name": str(payload.get("name", "")).strip(),
+        "email": str(payload.get("email", "")).strip(),
+        "phone": str(payload.get("phone", "")).strip(),
+        "organization": str(payload.get("organization", "")).strip(),
+        "category": str(payload.get("category", "")).strip(),
+        "family": str(payload.get("family", "")).strip(),
+        "names": str(payload.get("names", "")).strip(),
+        "relationships": str(payload.get("relationships", "")).strip(),
+        "locations": str(payload.get("locations", "")).strip(),
+        "dates": str(payload.get("dates", "")).strip(),
+        "narrative": str(payload.get("narrative", "")).strip(),
+        "research_question": str(payload.get("research_question", "")).strip(),
+        "source_description": str(payload.get("source_description", "")).strip(),
+        "document_reference": str(payload.get("document_reference", "")).strip(),
+        "consent_contact": bool(payload.get("consent_contact")),
+        "consent_publish": bool(payload.get("consent_publish")),
+        "submitter_hash": submitter_hash,
+        "status": "intake_review",
+        "gate": "gate_0_intake_integrity",
+        "assigned_tier": None,
+        "final_disposition": None,
+        "created_at": time.time(),
+        "source": "kvsvsearch.github.io/contribute",
+    }
+
+    db = _get_contribute_firestore()
+    if db is None:
+        return jsonify({"error": "storage_not_configured"}), 500
+
+    try:
+        ref = db.collection("contribute_submissions").document()
+        case_id = ref.id
+        submission["case_id"] = case_id
+        ref.set(submission)
+    except Exception as e:
+        return jsonify({"error": f"storage failed: {e}"}), 500
+
+    email_sent = False
+    email_error = None
+    if _SENDGRID_AVAILABLE and SENDGRID_API_KEY and SENDGRID_FROM and SENDGRID_TO:
+        try:
+            body_lines = [
+                f"{k}: {v}" for k, v in submission.items() if k != "submitter_hash"
+            ]
+            message = Mail(
+                from_email=SENDGRID_FROM,
+                to_emails=SENDGRID_TO,
+                subject=f"KVSV Contribute -- new submission {case_id}",
+                plain_text_content="\n".join(body_lines),
+            )
+            SendGridAPIClient(SENDGRID_API_KEY).send(message)
+            email_sent = True
+        except Exception as e:
+            email_error = str(e)
+    else:
+        email_error = "sendgrid_not_configured"
+
+    return jsonify({
+        "ok": True,
+        "case_id": case_id,
+        "status": "intake_review",
+        "email_sent": email_sent,
+        "email_error": email_error,
+    }), 200
