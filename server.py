@@ -294,6 +294,109 @@ def dawes_search():
         "pagesFetched": pages_fetched,
         "results": results,
     })
+# ==========================================================================
+# Contact form intake -- wires the previously-decorative Contact page to a
+# real email send. Uses the same SendGrid credentials already configured for
+# the Contribute flow (SENDGRID_API_KEY / SENDGRID_FROM / SENDGRID_TO) --
+# no new environment variables required if Contribute's email is already
+# working. Deliberately simpler than /api/contribute: no Firestore case
+# record, no Turnstile CAPTCHA, no idempotency/rate-limit table -- this is a
+# "send an email" form, not an intake-and-review pipeline. A basic honeypot
+# field (see contact.html) and a light in-memory rate limit are the only
+# spam defenses; add Turnstile here too later if spam becomes a real problem.
+#
+# Paste this whole block into server.py, above the
+# `if __name__ == "__main__":` line, alongside /api/contribute. Requires
+# only `requests`/SendGrid, both already imported earlier in the file.
+# ==========================================================================
+import time as _contact_time
+import re as _contact_re
+
+CONTACT_MAX_BODY_BYTES = 16 * 1024
+CONTACT_FIELD_MAX = {"name": 200, "email": 320, "subject": 120, "message": 4000}
+CONTACT_SUBJECTS = {
+    "General question", "Correction request", "Deletion request", "Something else",
+}
+_CONTACT_EMAIL_RE = _contact_re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Simple in-memory per-IP rate limit: 5 sends per hour. Resets on redeploy --
+# fine for a low-volume contact form; move to Firestore (like /api/contribute
+# already does) if this needs to survive restarts or scale across instances.
+_contact_rate = {}
+CONTACT_RATE_LIMIT = 5
+CONTACT_RATE_WINDOW = 3600
+
+
+def _contact_rate_ok(ip):
+    now = _contact_time.time()
+    window_start, count = _contact_rate.get(ip, (now, 0))
+    if now - window_start >= CONTACT_RATE_WINDOW:
+        window_start, count = now, 0
+    if count >= CONTACT_RATE_LIMIT:
+        return False
+    _contact_rate[ip] = (window_start, count + 1)
+    return True
+
+
+@app.route("/api/contact", methods=["POST"])
+def contact():
+    if not request.is_json:
+        return jsonify({"error": "Invalid request."}), 415
+    if request.content_length is not None and request.content_length > CONTACT_MAX_BODY_BYTES:
+        return jsonify({"error": "Message too long."}), 413
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid request."}), 400
+
+    # Honeypot: a real visitor never fills this hidden field in. A filled-in
+    # honeypot means a bot -- return a fake success so the bot doesn't learn
+    # anything, without actually sending an email.
+    if (payload.get("website") or "").strip():
+        return jsonify({"ok": True}), 200
+
+    ip = request.remote_addr or ""
+    if ip and not _contact_rate_ok(ip):
+        return jsonify({"error": "Please try again later."}), 429
+
+    name = (payload.get("name") or "").strip()
+    email = (payload.get("email") or "").strip()
+    subject = (payload.get("subject") or "General question").strip()
+    message = (payload.get("message") or "").strip()
+
+    if not name or not email or not message:
+        return jsonify({"error": "Name, email, and message are required."}), 400
+    if not _CONTACT_EMAIL_RE.match(email):
+        return jsonify({"error": "Enter a valid email address."}), 400
+    if subject not in CONTACT_SUBJECTS:
+        subject = "General question"
+    for field_name, value in (("name", name), ("email", email), ("subject", subject), ("message", message)):
+        if len(value) > CONTACT_FIELD_MAX[field_name]:
+            return jsonify({"error": f"{field_name} is too long."}), 400
+
+    if not (_SENDGRID_AVAILABLE and SENDGRID_API_KEY and SENDGRID_FROM and SENDGRID_TO):
+        _log.error("contact: SendGrid not configured")
+        return jsonify({"error": "The message could not be sent right now. Please try again later."}), 503
+
+    try:
+        body = (
+            f"New message from the KVSV Contact page.\n\n"
+            f"From: {name} <{email}>\n"
+            f"Subject: {subject}\n\n"
+            f"{message}\n"
+        )
+        SendGridAPIClient(SENDGRID_API_KEY).send(Mail(
+            from_email=SENDGRID_FROM,
+            to_emails=SENDGRID_TO,
+            subject=f"KVSV Contact -- {subject}",
+            plain_text_content=body,
+        ))
+    except Exception:
+        _log.exception("contact: send failed")
+        return jsonify({"error": "The message could not be sent right now. Please try again later."}), 502
+
+    return jsonify({"ok": True}), 200
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8781))
     app.run(host="0.0.0.0", port=port)
