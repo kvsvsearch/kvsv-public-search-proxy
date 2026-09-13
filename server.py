@@ -148,7 +148,152 @@ def nara_search():
 @app.route("/api/health")
 def health():
     return jsonify({"ok": True})
+# ==========================================================================
+# Dawes Rolls (Final Rolls of Citizens and Freedmen of the Five Civilized
+# Tribes) -- Oklahoma Historical Society dedicated per-person index.
+#
+# WHY THIS EXISTS: the existing /api/nara-search route queries NARA's general
+# catalog full-text search. That is NOT a name index -- confirmed live and in
+# this project's own NARA_BATCH_PROGRESS.md notes: a bare surname query (e.g.
+# "Bradford") returns tens of thousands of hits dominated by unrelated Civil
+# War pension files, with zero Dawes Roll / tribal enrollment matches. OHS's
+# own dedicated Dawes Rolls database is the confirmed-working per-person
+# index for the Five Civilized Tribes (Cherokee, Chickasaw, Choctaw, Muscogee
+# Creek, Seminole), 1898-1914. This is a second, independent public source,
+# added alongside WikiTree and NARA, not a replacement for either.
+#
+# Paste this whole block into server.py, above the
+# `if __name__ == "__main__":` line (i.e. alongside the existing
+# wikitree_search()/nara_search() routes). Requires only `requests`, already
+# imported at the top of the file.
+# ==========================================================================
+import re as _dawes_re
 
+DAWES_BASE_URL = "https://www.okhistory.org/research/dawesresults"
+
+# OHS's own HTML omits the closing </td> on the "Tribe / Card Group" cell
+# (confirmed by direct inspection of a live response) -- the regex below
+# accounts for that with a lookahead instead of matching a closing tag.
+_DAWES_ROW_RE = _dawes_re.compile(
+    r'<tr class="data"><td><strong>(?P<name>.*?)</strong></td>'
+    r'<td>(?P<age>.*?)</td>'
+    r'<td>(?P<sex>.*?)</td>'
+    r'<td>(?P<blood>.*?)</td>'
+    r'<td>(?P<roll>.*?)</td>'
+    r'<td>(?P<group>.*?)(?=<td)'
+    r'<td[^>]*>(?P<note>.*?)</td>'
+    r'<td class="census"><a href="(?P<link>[^"]*)"[^>]*>.*?</a></td></tr>',
+    _dawes_re.DOTALL,
+)
+_DAWES_TOTAL_RE = _dawes_re.compile(r'Your search returned\s*(\d+)\s*results')
+_DAWES_PAGE_RE = _dawes_re.compile(r'\(Page\s*(\d+)\s*of\s*(\d+)\)')
+
+# Hard cap: this is a real per-person index, not a noisy full-text search, so
+# common surnames can legitimately return hundreds of individual card rows
+# (each household member is its own row). Capping at 3 pages (150 rows) keeps
+# response time reasonable without silently pretending the source has 0
+# results for a common name -- "count" vs "totalAvailable" in the response
+# tells the frontend when more exist beyond the cap.
+DAWES_MAX_PAGES = 3
+
+
+def _dawes_clean(s):
+    if s is None:
+        return ""
+    s = s.replace("&nbsp;", " ").replace("<br>", " ").replace("<br/>", " ")
+    s = _dawes_re.sub(r"<[^>]+>", " ", s)  # strip any other stray tags
+    s = _dawes_re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+@app.route("/api/dawes-search")
+def dawes_search():
+    last_name = request.args.get("lastName", "").strip()
+    first_name = request.args.get("firstName", "").strip()
+    tribe = request.args.get("tribe", "").strip()  # optional: Cherokee, Chickasaw, Choctaw, Creek, Seminole
+    if not last_name and not first_name:
+        return jsonify({"error": "lastName or firstName required"}), 400
+
+    results = []
+    total_available = None
+    pages_fetched = 0
+
+    for page_no in range(1, DAWES_MAX_PAGES + 1):
+        params = {
+            "fname": first_name,
+            "lname": last_name,
+            "tribe": tribe,
+            "rollnum": "",
+            "cardnum": "",
+        }
+        if page_no > 1:
+            params["pageno"] = str(page_no)
+            params["action"] = "Search"
+        try:
+            resp = requests.get(DAWES_BASE_URL, params=params, timeout=15)
+        except Exception as e:
+            if pages_fetched == 0:
+                return jsonify({"error": str(e)}), 502
+            break  # already have some results from earlier pages -- return those
+        if not resp.ok:
+            if pages_fetched == 0:
+                return jsonify({"error": f"OHS Dawes Rolls returned HTTP {resp.status_code}"}), 502
+            break
+        html = resp.text
+        pages_fetched += 1
+
+        if total_available is None:
+            m = _DAWES_TOTAL_RE.search(html)
+            total_available = int(m.group(1)) if m else None
+            if total_available == 0:
+                break  # "Your search returned 0 results" -- nothing to parse
+
+        for m in _DAWES_ROW_RE.finditer(html):
+            g = m.groupdict()
+            name = _dawes_clean(g["name"])
+            if not name:
+                continue
+            group = _dawes_clean(g["group"])  # e.g. "Cherokee by Blood"
+            blood = _dawes_clean(g["blood"])
+            age = _dawes_clean(g["age"])
+            sex = _dawes_clean(g["sex"])
+            roll = _dawes_clean(g["roll"])
+            note = _dawes_clean(g["note"])
+            link = g["link"]
+            source_url = (
+                f"https://www.okhistory.org/research/{link}"
+                if link else DAWES_BASE_URL
+            )
+            note_parts = [p for p in [
+                group,
+                f"blood quantum {blood}" if blood else "",
+                f"roll no. {roll}" if roll else "",
+                note,
+            ] if p]
+            results.append({
+                "source": "Oklahoma Historical Society — Dawes Rolls",
+                "sourceUrl": source_url,
+                "name": name,
+                "birthDate": None,
+                "deathDate": None,
+                "birthLocation": None,
+                "deathLocation": None,
+                "age": age or None,
+                "sex": sex or None,
+                "note": "; ".join(note_parts) if note_parts else None,
+            })
+
+        pm = _DAWES_PAGE_RE.search(html)
+        if not pm or pm.group(1) == pm.group(2):
+            break  # no more pages
+
+    return jsonify({
+        "query": {"lastName": last_name, "firstName": first_name, "tribe": tribe},
+        "count": len(results),
+        "totalAvailable": total_available if total_available is not None else len(results),
+        "pagesFetched": pages_fetched,
+        "results": results,
+    })
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8781))
     app.run(host="0.0.0.0", port=port)
